@@ -31,6 +31,89 @@ export interface DiffResult {
   totalSubChanges: number;
 }
 
+export interface SmartFilterStats {
+  totalBefore: number;
+  totalAfter: number;
+  hiddenNoise: number;
+}
+
+// --- Smart filter: detect minifier noise ---
+
+const SINGLE_CHAR = /^[a-zA-Z_$]$/;
+const SHORT_MINIFIED = /^[a-zA-Z_$][a-zA-Z0-9_$]?$/;
+
+function isMinifierRename(before: string | undefined, after: string | undefined): boolean {
+  if (!before || !after) return false;
+  // Both are short minified names — this is just variable renaming
+  if (SHORT_MINIFIED.test(before) && SHORT_MINIFIED.test(after)) return true;
+  // One is single-char (minified) and the other is also short
+  if (SINGLE_CHAR.test(before) && SHORT_MINIFIED.test(after)) return true;
+  if (SHORT_MINIFIED.test(before) && SINGLE_CHAR.test(after)) return true;
+  return false;
+}
+
+const NOISE_SUB_CHANGE_PATTERNS: Array<(sub: SubChange) => boolean> = [
+  // Minifier variable renames: e → t, r → n, etc.
+  (sub) => sub.path.endsWith(".name") && sub.kind === "modified" && isMinifierRename(sub.before, sub.after),
+  // var/let/const kind changes — minifiers switch these freely
+  (sub) => sub.path.endsWith(".kind") && sub.kind === "modified" && ["var", "let", "const"].includes(sub.before ?? "") && ["var", "let", "const"].includes(sub.after ?? ""),
+  // FunctionExpression ↔ ArrowFunctionExpression — minifier artifact
+  (sub) => sub.path.endsWith(".type") && sub.kind === "modified" && isFuncTypeSwap(sub.before, sub.after),
+  // expression field toggling (expression: true/false on arrow fns)
+  (sub) => sub.path.endsWith(".expression") && sub.kind === "modified",
+  // generator/async false→false or unchanged booleans that deep-diff picks up
+  (sub) => sub.kind === "modified" && sub.before === sub.after,
+];
+
+function isFuncTypeSwap(a?: string, b?: string): boolean {
+  const funcTypes = new Set(["FunctionExpression", "ArrowFunctionExpression", "FunctionDeclaration"]);
+  return !!a && !!b && funcTypes.has(a) && funcTypes.has(b);
+}
+
+function isNoiseSubChange(sub: SubChange): boolean {
+  return NOISE_SUB_CHANGE_PATTERNS.some((fn) => fn(sub));
+}
+
+function isNoiseGroupedChange(change: GroupedChange): boolean {
+  // Modified nodes where ALL sub-changes are noise → hide the whole thing
+  if (change.kind === "modified") {
+    return change.subChanges.length > 0 && change.subChanges.every(isNoiseSubChange);
+  }
+  return false;
+}
+
+export function applySmartFilter(result: DiffResult): { filtered: DiffResult; stats: SmartFilterStats } {
+  const totalBefore = result.changes.length;
+  const filtered: GroupedChange[] = [];
+
+  for (const change of result.changes) {
+    if (isNoiseGroupedChange(change)) continue;
+
+    if (change.kind === "modified") {
+      // Keep the change but remove noise sub-changes
+      const cleanSubs = change.subChanges.filter((s) => !isNoiseSubChange(s));
+      if (cleanSubs.length === 0) continue;
+      filtered.push({ ...change, subChanges: cleanSubs });
+    } else {
+      filtered.push(change);
+    }
+  }
+
+  const added = filtered.filter((c) => c.kind === "added").length;
+  const removed = filtered.filter((c) => c.kind === "removed").length;
+  const modified = filtered.filter((c) => c.kind === "modified").length;
+  const totalSubChanges = filtered.reduce((sum, c) => sum + c.subChanges.length, 0);
+
+  return {
+    filtered: { changes: filtered, added, removed, modified, totalSubChanges },
+    stats: {
+      totalBefore,
+      totalAfter: filtered.length,
+      hiddenNoise: totalBefore - filtered.length,
+    },
+  };
+}
+
 type ASTNode = Record<string, unknown>;
 
 // --- Helpers to extract names/info from AST nodes ---
